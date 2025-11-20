@@ -1,4 +1,4 @@
-name: PHP CI / WP-Simple-Widget
+name: PHP CI / WP-Simple-Widget (verbose)
 
 on:
   push:
@@ -8,7 +8,6 @@ on:
 
 jobs:
   php-ci:
-    name: PHP ${{ matrix.php-version }} → lint & test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -16,8 +15,23 @@ jobs:
         php-version: ["7.4", "8.0", "8.1", "8.2"]
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Print runner info
+        run: |
+          uname -a
+          php --version || true
+          composer --version || true
+
+      - name: List repository files (top level)
+        run: |
+          echo "=== Root listing ==="
+          ls -la
+          echo "=== .github listing ==="
+          ls -la .github || true
+          echo "=== repo tree (shallow) ==="
+          find . -maxdepth 2 -type f -print | sed -n '1,200p'
 
       - name: Set up PHP ${{ matrix.php-version }}
         uses: shivammathur/setup-php@v3
@@ -27,57 +41,81 @@ jobs:
           ini-values: post_max_size=256M, memory_limit=2G
           tools: composer:v2
 
-      - name: Validate composer exists (skip if none)
-        run: composer --version
+      - name: Debug environment variables
+        run: env | sort
 
-      - name: Cache Composer dependencies
-        uses: actions/cache@v4
-        with:
-          path: vendor
-          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-composer-
+      - name: Validate composer & show composer.json if present
+        run: |
+          if [ -f composer.json ]; then
+            echo "composer.json exists"
+            jq . composer.json || cat composer.json
+          else
+            echo "No composer.json found"
+          fi
+        shell: bash
 
       - name: Install Composer dependencies (if composer.json present)
         if: ${{ hashFiles('**/composer.json') != '' }}
-        run: composer install --no-progress --prefer-dist --no-interaction
-
-      - name: Ensure phpunit is available (install locally if not)
-        if: ${{ hashFiles('**/composer.json') == '' || !contains(steps.install.outputs, 'phpunit') }}
         run: |
-          php -r "file_exists('vendor/bin/phpunit') || copy('https://getcomposer.org/installer', 'composer-setup.php');"
-          php composer-setup.php --quiet
-          php composer.phar require --dev phpunit/phpunit:^9 --no-interaction
+          set -euo pipefail
+          composer install --no-progress --prefer-dist --no-interaction
         shell: bash
 
-      - name: Run PHPCS (code style) — skip if no config
+      - name: Show existence of phpunit/phpcs and config
+        run: |
+          echo "vendor/bin files:"
+          ls -la vendor/bin || true
+          echo "phpunit.xml present?"; [ -f phpunit.xml ] && echo "yes" || echo "no"
+          echo "phpcs config present?"; [ -f phpcs.xml ] && echo "yes" || echo "no"
+
+      - name: Run PHPCS (if config present) — verbose
         if: ${{ hashFiles('**/phpcs.xml') != '' || hashFiles('**/phpcs.xml.dist') != '' || hashFiles('**/composer.json') != '' }}
         run: |
-          # prefer vendor phpcs if present, otherwise try global
+          set -euo pipefail
+          echo "Running PHPCS..."
           if [ -f vendor/bin/phpcs ]; then
-            vendor/bin/phpcs --standard=phpcs.xml --extensions=php --ignore=vendor .
+            vendor/bin/phpcs --standard=phpcs.xml --extensions=php --ignore=vendor . || { echo "PHPCS failed with exit $?: check output above"; exit 3; }
           else
-            phpcs --standard=phpcs.xml --extensions=php --ignore=vendor .
+            phpcs --standard=phpcs.xml --extensions=php --ignore=vendor . || { echo "PHPCS failed (no vendor phpcs). Exit code: $?. Exiting with 3"; exit 3; }
           fi
+        shell: bash
 
-      - name: Run PHPUnit tests (if tests exist)
+      - name: Run PHPUnit tests (if tests exist) — verbose + produce junit
         if: ${{ hashFiles('**/tests/**/*.php') != '' || hashFiles('phpunit.xml') != '' || hashFiles('phpunit.xml.dist') != '' }}
         run: |
+          set -euo pipefail
+          echo "Running PHPUnit..."
           if [ -f vendor/bin/phpunit ]; then
-            vendor/bin/phpunit --configuration phpunit.xml || vendor/bin/phpunit --configuration phpunit.xml.dist
+            vendor/bin/phpunit --configuration phpunit.xml || vendor/bin/phpunit --configuration phpunit.xml.dist || { echo "PHPUnit failed with exit $?"; exit 3; }
           else
-            ./vendor/bin/phpunit --configuration phpunit.xml || ./vendor/bin/phpunit --configuration phpunit.xml.dist || phpunit --configuration phpunit.xml
+            echo "vendor/bin/phpunit not found. Trying global phpunit..."
+            phpunit --configuration phpunit.xml || phpunit --configuration phpunit.xml.dist || { echo "PHPUnit (global) failed with exit $?"; exit 3; }
           fi
+        shell: bash
 
-      - name: Basic sanity check — plugin PHP lint
+      - name: PHP syntax check for repo PHP files
         run: |
-          # check PHP syntax for all plugin php files
-          set -e
+          set -euo pipefail
           files=$(git ls-files '*.php' | grep -v '^vendor/' || true)
           if [ -n "$files" ]; then
+            echo "Checking PHP syntax of files:"
+            echo "$files"
             for f in $files; do
-              php -l "$f" || (echo "PHP syntax error in $f" && exit 1)
+              echo "-> lint $f"
+              php -l "$f" || { echo "PHP lint failed for $f"; exit 3; }
             done
           else
-            echo "No PHP files found to lint."
+            echo "No PHP files to lint"
           fi
+        shell: bash
+
+      - name: Upload PHPUnit logs (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ matrix.php-version }}
+          path: |
+            ./phpunit.xml
+            ./tests/logs || true
+            ./build || true
+          retention-days: 3

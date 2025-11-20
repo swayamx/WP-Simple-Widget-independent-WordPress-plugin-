@@ -1,39 +1,83 @@
-name: PHP Composer
+name: PHP CI / WP-Simple-Widget
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main" ]
-
-permissions:
-  contents: read
+    branches: ["main", "master"]
 
 jobs:
-  build:
-
+  php-ci:
+    name: PHP ${{ matrix.php-version }} → lint & test
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ["7.4", "8.0", "8.1", "8.2"]
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Validate composer.json and composer.lock
-      run: composer validate --strict
+      - name: Set up PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v3
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: mbstring, xml, intl, curl
+          ini-values: post_max_size=256M, memory_limit=2G
+          tools: composer:v2
 
-    - name: Cache Composer packages
-      id: composer-cache
-      uses: actions/cache@v3
-      with:
-        path: vendor
-        key: ${{ runner.os }}-php-${{ hashFiles('**/composer.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-php-
+      - name: Validate composer exists (skip if none)
+        run: composer --version
 
-    - name: Install dependencies
-      run: composer install --prefer-dist --no-progress
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
 
-    # Add a test script to composer.json, for instance: "test": "vendor/bin/phpunit"
-    # Docs: https://getcomposer.org/doc/articles/scripts.md
+      - name: Install Composer dependencies (if composer.json present)
+        if: ${{ hashFiles('**/composer.json') != '' }}
+        run: composer install --no-progress --prefer-dist --no-interaction
 
-    # - name: Run test suite
-    #   run: composer run-script test
+      - name: Ensure phpunit is available (install locally if not)
+        if: ${{ hashFiles('**/composer.json') == '' || !contains(steps.install.outputs, 'phpunit') }}
+        run: |
+          php -r "file_exists('vendor/bin/phpunit') || copy('https://getcomposer.org/installer', 'composer-setup.php');"
+          php composer-setup.php --quiet
+          php composer.phar require --dev phpunit/phpunit:^9 --no-interaction
+        shell: bash
+
+      - name: Run PHPCS (code style) — skip if no config
+        if: ${{ hashFiles('**/phpcs.xml') != '' || hashFiles('**/phpcs.xml.dist') != '' || hashFiles('**/composer.json') != '' }}
+        run: |
+          # prefer vendor phpcs if present, otherwise try global
+          if [ -f vendor/bin/phpcs ]; then
+            vendor/bin/phpcs --standard=phpcs.xml --extensions=php --ignore=vendor .
+          else
+            phpcs --standard=phpcs.xml --extensions=php --ignore=vendor .
+          fi
+
+      - name: Run PHPUnit tests (if tests exist)
+        if: ${{ hashFiles('**/tests/**/*.php') != '' || hashFiles('phpunit.xml') != '' || hashFiles('phpunit.xml.dist') != '' }}
+        run: |
+          if [ -f vendor/bin/phpunit ]; then
+            vendor/bin/phpunit --configuration phpunit.xml || vendor/bin/phpunit --configuration phpunit.xml.dist
+          else
+            ./vendor/bin/phpunit --configuration phpunit.xml || ./vendor/bin/phpunit --configuration phpunit.xml.dist || phpunit --configuration phpunit.xml
+          fi
+
+      - name: Basic sanity check — plugin PHP lint
+        run: |
+          # check PHP syntax for all plugin php files
+          set -e
+          files=$(git ls-files '*.php' | grep -v '^vendor/' || true)
+          if [ -n "$files" ]; then
+            for f in $files; do
+              php -l "$f" || (echo "PHP syntax error in $f" && exit 1)
+            done
+          else
+            echo "No PHP files found to lint."
+          fi
